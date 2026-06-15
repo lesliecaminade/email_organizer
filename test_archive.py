@@ -71,15 +71,15 @@ def list_uids(host, port, username, password, mailbox='INBOX', num=10):
 
 
 def archive_email_by_uid(host, port, username, password, mailbox, uid, debug=False):
-    """Add a Gmail label to a message by UID so it can be archived later."""
+    """Archive a Gmail message by UID: remove it from the Inbox label."""
     with imaplib.IMAP4_SSL(host, port) as mail:
         mail.login(username, password)
         mail.select(mailbox)
-        # Label names with spaces must be quoted inside the X-GM-LABELS list.
-        typ, data = mail.uid('STORE', uid, '+X-GM-LABELS', '("TO BE ARCHIVED")')
+        # Remove the Inbox label so the message leaves the inbox.
+        typ, data = mail.uid('STORE', uid, '-X-GM-LABELS', '("Inbox")')
         if typ != 'OK':
-            raise RuntimeError(f'LABEL ADD failed for UID {uid}: {typ} {data}')
-    print(f"Added label 'TO BE ARCHIVED' to email UID {uid} in {mailbox}: {typ} {data}")
+            raise RuntimeError(f'ARCHIVE failed for UID {uid}: {typ} {data}')
+    print(f"Archived email UID {uid} by removing Inbox label: {typ} {data}")
 
 import sys
 import argparse
@@ -93,7 +93,7 @@ def main():
     show_parser = subparsers.add_parser("show", help="Show most recent email UIDs")
     show_parser.add_argument("--num", type=int, default=10, help="How many most recent UIDs to show")
 
-    arch_parser = subparsers.add_parser("archive", help="Add the 'TO BE ARCHIVED' label to a message by UID on Gmail")
+    arch_parser = subparsers.add_parser("archive", help="Archive a message by UID on Gmail (remove it from Inbox)")
     arch_parser.add_argument("uid", type=str, help="Exact UID of email to archive")
 
     args = parser.parse_args()

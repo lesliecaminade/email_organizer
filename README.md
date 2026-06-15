@@ -1,6 +1,6 @@
 # Hello World Email Agent
 
-This is a tiny Python AI agent that can run immediately in demo mode, then check today's real emails over IMAP when credentials are ready.
+This is a tiny Python AI agent that triages your inbox. It runs immediately in demo mode, then can check today's real emails over IMAP when credentials are ready.
 
 ## Step 1: Create a virtual environment
 
@@ -23,7 +23,7 @@ Copy the example files:
 
 ```bash
 cp email_credentials.example.json email_credentials.json
-cp openai_credentials.example.json openai_credentials.json
+cp ollama_credentials.example.json ollama_credentials.json
 ```
 
 Then edit these new files with your real values.
@@ -59,13 +59,24 @@ For Gmail, use an app password rather than your normal account password. Common 
 - Outlook / Microsoft 365: `outlook.office365.com`
 - Yahoo: `imap.mail.yahoo.com`
 
+## Configure the AI backend
+
+The agent uses a local Ollama server by default. Edit `ollama_credentials.json` to point at your server and model:
+
+```json
+{
+	"url": "http://localhost:11434",
+	"model": "llama3.1"
+}
+```
+
 ## Run the demo now
 
 ```bash
 python email_agent.py
 ```
 
-Demo mode uses sample emails and a local priority scorer, so it runs without private credentials or OpenAI calls.
+Demo mode uses sample emails and a local priority scorer, so it runs without private credentials or AI calls.
 
 ## Run against your real inbox
 
@@ -79,16 +90,20 @@ Optional: check fewer emails from each account:
 python email_agent.py --live --limit 10
 ```
 
-## Mark emails as important or not important
+## How it triages emails
 
-You can label messages by their index in the list. These labels will be saved to `feedback.json` and affect future runs.
+For each email, the agent asks the AI to classify it into one of three labels:
 
-```bash
-python email_agent.py --important 1,3
-python email_agent.py --not-important 2
-python email_agent.py --live --important 1 --not-important 2
-```
+- **KEEP** — Actionable now: needs a reply, decision, approval, meeting, payment, or task.
+- **TO BE ARCHIVED** — Not actionable but worth saving: newsletters, FYIs, automated reports, completed threads.
+- **DELETE** — Spam, junk, scams, or irrelevant.
+
+In `--live` mode the agent applies the corresponding Gmail action:
+
+- **KEEP** → adds the `KEEP` label and leaves the email in the inbox.
+- **TO BE ARCHIVED** → adds the `TO BE ARCHIVED` label and removes the email from the Inbox.
+- **DELETE** → permanently deletes the email.
 
 ## What it does
 
-The script prints a hello-world message, gathers emails, and prints a ranked summary of the most important items. If `openai_credentials.json` contains a real API key, it uses OpenAI for the summary. If not, it uses a simple local scorer so the app still runs.
+The script prints a hello-world message, gathers emails, classifies them, applies IMAP actions in live mode, and prints a ranked summary of the most important kept items.

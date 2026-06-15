@@ -8,12 +8,13 @@ from datetime import date
 from email.header import decode_header
 from email.message import Message
 from pathlib import Path
+from pathlib import Path
 from typing import Any
 
 
 EMAIL_CREDENTIALS_PATH = Path("email_credentials.json")
-OPENAI_CREDENTIALS_PATH = Path("openai_credentials.json")
 FEEDBACK_PATH = Path("feedback.json")
+OLLAMA_CREDENTIALS_PATH = Path("ollama_credentials.json")
 CHARS_PER_TOKEN_ESTIMATE = 4
 MAX_EMAIL_PREVIEW_TOKENS = 300
 MAX_SINGLE_EMAIL_PROMPT_TOKENS = 500
@@ -21,7 +22,6 @@ MAX_BATCH_EMAIL_PROMPT_TOKENS = 250
 MAX_DIGEST_PROMPT_TOKENS = 5500
 PLACEHOLDER_VALUES = {
     "",
-    "sk-your-openai-api-key",
     "first-app-password",
     "first@example.com",
     "second-app-password",
@@ -31,6 +31,8 @@ PLACEHOLDER_VALUES = {
     "your-second-email@example.com",
     "your-second-email-app-password",
 }
+
+OLLAMA_PLACEHOLDERS = {"", "ollama-server", "model-name"}
 
 
 @dataclass
@@ -76,6 +78,16 @@ def load_json(path: Path) -> Any:
 
     with path.open("r", encoding="utf-8") as file:
         return json.load(file)
+
+
+def load_ollama_credentials() -> dict[str, str]:
+    if not OLLAMA_CREDENTIALS_PATH.exists():
+        # Provide a minimal default that points to the local server
+        return {"url": "http://localhost:11434", "model": "llama3.1"}
+    creds = load_json(OLLAMA_CREDENTIALS_PATH)
+    url = creds.get("url") or "http://localhost:11434"
+    model = creds.get("model") or "llama3.1"
+    return {"url": url, "model": model}
 
 
 def get_email_account_entries(raw_credentials: Any) -> list[dict[str, Any]]:
@@ -142,6 +154,31 @@ def looks_configured(value: str | None) -> bool:
         and not normalized.startswith("your-")
         and "@example." not in normalized
     )
+
+
+def looks_ollama_configured(value: str | None) -> bool:
+    if not value:
+        return False
+    normalized = value.strip()
+    return bool(
+        normalized
+        and normalized not in OLLAMA_PLACEHOLDERS
+        and ("http://" in normalized or "https://" in normalized)
+    )
+
+
+def load_ollama_client() -> Any:
+    """Load and return an Ollama client using configured credentials."""
+    from ollama import Client as OllamaClient
+
+    cfg = load_ollama_credentials()
+    url = cfg.get("url") or "http://localhost:11434"
+    if not looks_ollama_configured(url):
+        raise RuntimeError(
+            f"Ollama URL is not configured: {url!r}. "
+            "Update ollama_credentials.json with a valid server URL."
+        )
+    return OllamaClient(host=url), cfg
 
 
 def decode_mime_header(value: str | None) -> str:
@@ -371,79 +408,76 @@ def summarize_locally(messages: list[EmailMessage]) -> str:
 
 def classify_messages(messages: list[EmailMessage]) -> list[str]:
     """
-    Uses OpenAI to decide for each message: 'keep' (INBOX) or 'trash' (move to Trash).
-    Key criteria: 'keep' for actionable emails (require a reply, action, or decision), 'trash' for everything else.
+    Uses Ollama to decide for each message.
+    Key criteria: 'KEEP' for actionable emails (require a reply, action, or decision), 'DELETE' for spam/junk, 'TO BE ARCHIVED' for everything else.
     """
-    credentials = load_json(OPENAI_CREDENTIALS_PATH)
-    api_key = credentials.get("api_key")
-    model = credentials.get("model", "gpt-4o-mini")
-    if not looks_configured(api_key):
-        # fallback: keep old heuristic if OpenAI key is not configured
-        actions = []
-        trash_terms = ["lottery", "winner", "free money", "viagra", "porn", "click here"]
-        for msg in messages:
-            text = f"{msg.subject} {msg.body_preview} {msg.sender}".lower()
-            if any(term in text for term in trash_terms):
-                actions.append("trash")
-            else:
-                actions.append("keep")
-        return actions
+    print("\n[AI] Starting email classification...")
 
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
-
-    email_digest = build_email_digest(messages, max_body_tokens=MAX_BATCH_EMAIL_PROMPT_TOKENS)
-
-    sys_prompt = (
-        "You are an email triage assistant. "
-        "Classify each message as either 'keep' (if actionable: requires a reply, user action, or decision), or 'trash' (if not actionable, or spam, or irrelevant).\n"
-        "Output a JSON array with one value per input email: 'keep' or 'trash'. "
-        "Do NOT include any commentary—just output the array."
-    )
-
-    # Make the list of emails the user sees
-    prompt = (
-        f"Classify the following emails as 'keep' or 'trash' based on whether they're actionable or not.\n"
-        f"Emails:\n{email_digest}\n---"
-    )
-
-    raw = client.chat.completions.create(
-        model=model,
-        temperature=0,
-        messages=[
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": prompt},
-        ]
-    ).choices[0].message.content
-
-    import json as _json
-    # Try to robustly extract the list (LLM may sometimes add text)
-    if '[' in raw:
-        raw = raw[raw.index('['):]
     try:
-        parsed = _json.loads(raw)
-    except Exception:
-        # fallback (just in case OpenAI output is not valid JSON)
-        parsed = []
-        for line in raw.splitlines():
-            v = line.strip().strip('"')
-            if v in ("keep", "trash"):
-                parsed.append(v)
-    # Ensure exactly one action per message
-    result = []
-    for i in range(len(messages)):
-        try:
-            v = parsed[i]
-        except Exception:
-            v = "keep"
-        if v not in ("keep", "trash"):
-            v = "keep"
-        result.append(v)
-    return result
+        client, cfg = load_ollama_client()
+    except Exception as e:
+        print(f"[Ollama configuration error]: {e}")
+        return _heuristic_classify_messages(messages)
+
+    ollama_model = cfg.get("model") or "llama3.1"
+
+    print(f"[AI] Using Ollama ({ollama_model}) for classification...")
+    email_digest = build_email_digest(messages, max_body_tokens=MAX_BATCH_EMAIL_PROMPT_TOKENS)
+    prompt = (
+        "You are a strict email triage assistant. Your job is to decide whether each email "
+        "requires the user's attention or can be removed from the inbox.\n\n"
+        "Classify each message as exactly one of: KEEP, TO BE ARCHIVED, or DELETE.\n"
+        "- 'KEEP': The email is actionable NOW. It requires a reply, a decision, an approval, "
+        "a scheduled meeting, a payment, or any task the user must perform. Err on the side of KEEP "
+        "if the user might need to do something because of this email.\n"
+        "- 'TO BE ARCHIVED': The email is NOT actionable but may have reference value. Examples: newsletters, "
+        "announcements, completed threads, FYIs, automated reports, notifications that need no response, "
+        "and anything the user might want to find later but does not need to act on today.\n"
+        "- 'DELETE': The email is spam, junk, promotional garbage, scams, or completely irrelevant.\n\n"
+        "Be decisive. Do not mark informational or notification-only emails as KEEP unless they clearly need a "
+        "response or action. Default non-actionable legitimate mail to TO BE ARCHIVED, not KEEP.\n"
+        f"Emails:\n{email_digest}\n---\nOutput one label per line: KEEP, TO BE ARCHIVED, or DELETE."
+    )
+
+    try:
+        print("[AI] Sending classification request to Ollama...")
+        response = client.generate(model=ollama_model, prompt=prompt)
+        print("[AI] Received classification response from Ollama")
+        raw = response.get("response", "")
+        # Ollama returns plain text; parse into list
+        parsed = [line.strip().upper() for line in raw.splitlines() if line.strip()]
+        result = parsed[:len(messages)] or ['TO BE ARCHIVED'] * len(messages)
+
+        # Validate and normalize results
+        validated_result = []
+        for v in result:
+            if v not in ("KEEP", "TO BE ARCHIVED", "DELETE"):
+                v = "TO BE ARCHIVED"  # Default non-actionable mail to TO BE ARCHIVED on invalid response
+            validated_result.append(v)
+        return validated_result
+
+    except Exception as e:
+        print(f"[Ollama error during classification]: {e}")
+
+    # Final fallback to heuristic-based classification
+    return _heuristic_classify_messages(messages)
+
+
+def _heuristic_classify_messages(messages: list[EmailMessage]) -> list[str]:
+    actions = []
+    delete_terms = ["lottery", "winner", "free money", "viagra", "porn"]
+    for msg in messages:
+        text = f"{msg.subject} {msg.body_preview}".lower()
+        if any(term in text for term in delete_terms):
+            actions.append("DELETE")
+        else:
+            actions.append("KEEP")
+    return actions
 
 
 
 from imap_simple_actions import archive_email_by_uid, delete_email_by_uid, important_email_by_uid
+from typing import Any
 
 
 def get_mailbox_count(host: str, port: int, username: str, password: str, mailbox: str) -> int:
@@ -466,34 +500,37 @@ def confirm_mailbox_reduction(host: str, port: int, username: str, password: str
     return after_count, after_count < before_count
 
 
-def summarize_with_openai(messages: list[EmailMessage]) -> str:
-    credentials = load_json(OPENAI_CREDENTIALS_PATH)
-    api_key = credentials.get("api_key")
-    if not looks_configured(api_key):
+def summarize_with_ollama(messages: list[EmailMessage]) -> str:
+    """Use Ollama as the summarization engine."""
+    try:
+        client, cfg = load_ollama_client()
+    except Exception as e:
+        print(f"[Ollama configuration error]: {e}")
         return summarize_locally(messages)
 
-    from openai import OpenAI
+    ollama_model = cfg.get("model") or "llama3.1"
 
-    client = OpenAI(api_key=api_key)
-    model = credentials.get("model", "gpt-4o-mini")
-
-    if not messages:
-        return "Hello world from your email agent. I did not find any emails from today."
+    print(f"📝 Summarizing {len(messages)} emails using Ollama ({ollama_model})...")
 
     email_digest = build_email_digest(messages, max_body_tokens=MAX_BATCH_EMAIL_PROMPT_TOKENS)
-
     prompt = (
         "You are a practical email triage assistant. "
         "Summarize the most important emails from today. "
-        "Prioritize deadlines, security issues, direct requests, meetings, invoices, and anything requiring action. "
-        + f"Today's emails:\n{email_digest}"
+        "Prioritize deadlines, security issues, direct requests, meetings, invoices, and anything requiring action.\n"
+        f"Today's emails:\n{email_digest}"
     )
 
-    response = client.responses.create(
-        model=model,
-        input=prompt,
-    )
-    return response.output_text
+    try:
+        print("   Sending request to Ollama...")
+        response = client.generate(model=ollama_model, prompt=prompt)
+        print("✓ Summary generated successfully")
+        return response.get("response", "")
+
+    except Exception as e:
+        print(f"[Ollama error during summarization]: {e}")
+
+    # Final fallback to local heuristic-based summary
+    return summarize_locally(messages)
 
 
 def apply_labels(messages: list[EmailMessage], feedback: dict[str, int], indices: list[int], label: int) -> list[int]:
@@ -520,31 +557,66 @@ def print_messages(messages: list[EmailMessage], feedback: dict[str, int]) -> No
     print()
 
 
-def classify_message_single(message, credentials, debug=False):
-    """Use OpenAI to classify a single EmailMessage: return 'keep', 'archive', or 'trash'."""
-    api_key = credentials.get("api_key")
-    model = credentials.get("model", "gpt-4o-mini")
-    if not api_key or api_key.startswith("sk-your-openai-api-key"):
-        return 'keep'  # fallback demo only
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
-    sys_prompt = (
-        "You are an email triage assistant. "
-        "Classify this message as 'keep', 'archive', or 'trash'. "
-        "'archive' means it is not actionable but worth saving and should be labeled TO BE ARCHIVED. "
-        "'trash' means it should be labeled TO BE DELETED. "
-        "'keep' means it is actionable and should be labeled SEEMS IMPORTANT. "
-        "Only output one word: keep, archive, or trash."
-    )
+def classify_message_single(message, credentials=None, debug=False):
+    """Use Ollama to classify a single EmailMessage; fall back to heuristic if needed."""
+
     email_body = format_email_for_prompt(message, max_body_tokens=MAX_SINGLE_EMAIL_PROMPT_TOKENS)
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0,
-        messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": email_body}],
-    ).choices[0].message.content.strip().lower()
-    if response in ('keep', 'archive', 'trash'):
-        return response
-    return 'keep'
+
+    sys_prompt = (
+        "You are a strict email triage assistant. Your job is to decide whether a single email "
+        "requires the user's attention or can be removed from the inbox.\n\n"
+        "Classify this message as exactly one of: KEEP, TO BE ARCHIVED, or DELETE.\n"
+        "- 'KEEP': The email is actionable NOW. It requires a reply, a decision, an approval, "
+        "a scheduled meeting, a payment, or any task the user must perform. Err on the side of KEEP "
+        "if the user might need to do something because of this email.\n"
+        "- 'TO BE ARCHIVED': The email is NOT actionable but may have reference value. Examples: newsletters, "
+        "announcements, completed threads, FYIs, automated reports, notifications that need no response, "
+        "and anything the user might want to find later but does not need to act on today.\n"
+        "- 'DELETE': The email is spam, junk, promotional garbage, scams, or completely irrelevant.\n\n"
+        "Be decisive. Do not mark informational or notification-only emails as KEEP unless they clearly need a "
+        "response or action. Default non-actionable legitimate mail to TO BE ARCHIVED, not KEEP.\n"
+        "Only output one label: KEEP, TO BE ARCHIVED, or DELETE."
+    )
+
+    try:
+        client, cfg = load_ollama_client()
+    except Exception as e:
+        print(f"[Ollama configuration error]: {e}")
+        return _heuristic_classify_single(message)
+
+    ollama_model = cfg.get("model") or "llama3.1"
+
+    print(f"🤖 Classifying email using Ollama ({ollama_model})...")
+    print(f"   From: {message.sender}")
+    print(f"   Subject: {message.subject}")
+
+    try:
+        response = client.generate(model=ollama_model, prompt=sys_prompt + "\n\nEmail:\n" + email_body)
+        raw = response.get("response", "").strip().upper()
+        print(f"✓ Ollama response: {raw}")
+
+        if raw in ('KEEP', 'TO BE ARCHIVED', 'DELETE'):
+            return raw
+
+    except Exception as e:
+        print(f"[Ollama error during single classification]: {e}")
+
+    # Final fallback to heuristic-based classification
+    return _heuristic_classify_single(message)
+
+
+def _heuristic_classify_single(message: EmailMessage) -> str:
+    text = f"{message.subject} {message.body_preview}".lower()
+    delete_terms = ["lottery", "winner", "free money", "viagra", "porn"]
+
+    if any(term in text for term in delete_terms):
+        return 'DELETE'
+    elif message.sender and ('@example.' not in message.sender) or '@gmail.com' in message.sender:
+        # Likely a real email - default to KEEP (actionable)
+        return 'KEEP'
+
+    return 'KEEP'  # Default safe fallback
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Triage and automate your email inbox, one message at a time.")
@@ -559,24 +631,22 @@ def main() -> None:
         account_names = ", ".join(account.name for account in email_accounts)
         print(f"Checking today's inbox across {len(email_accounts)} account(s): {account_names}\n")
         messages, message_uids, message_accounts = fetch_todays_emails(limit=args.limit, accounts=email_accounts)
-        credentials = load_json(OPENAI_CREDENTIALS_PATH)
         debug = args.debug
     else:
         debug = False
         print("Running demo mode with sample emails. Add --live when your credentials are ready.\n")
         messages, message_uids, message_accounts = demo_emails_with_ids()
-        credentials = load_json(OPENAI_CREDENTIALS_PATH)
 
     kept = []
-    archived = []
-    trashed = []
+    to_be_archived = []
+    deleted = []
 
     for idx, (msg, uid, account) in enumerate(zip(messages, message_uids, message_accounts), start=1):
-        action = classify_message_single(msg, credentials, debug=debug)
+        action = classify_message_single(msg, debug=debug)
         result = action
         # IMAP labeling for triage decisions (only live mode)
         if args.live and uid and account:
-            if action == 'trash':
+            if action == 'DELETE':
                 result = delete_email_by_uid(
                     account.host,
                     account.port,
@@ -586,7 +656,7 @@ def main() -> None:
                     uid,
                     debug=debug,
                 )
-            elif action == 'archive':
+            elif action == 'TO BE ARCHIVED':
                 result = archive_email_by_uid(
                     account.host,
                     account.port,
@@ -607,22 +677,22 @@ def main() -> None:
                     uid,
                     debug=debug,
                 )
-        if result in ('keep', 'kept'):
+        if result in ('KEEP',):
             kept.append(msg)
-        elif result == 'archive' or result == 'archived':
-            archived.append(msg)
-        elif result == 'trash' or result == 'trashed':
-            trashed.append(msg)
+        elif result in ('TO BE ARCHIVED',):
+            to_be_archived.append(msg)
+        elif result in ('DELETE',):
+            deleted.append(msg)
         account_label = f" | Account: {msg.account_name}" if msg.account_name else ""
-        print(f"[{idx}/{len(messages)}] Action: {action.upper()}{account_label} | Subject: {msg.subject}")
+        print(f"[{idx}/{len(messages)}] Action: {action}{account_label} | Subject: {msg.subject}")
 
     # Most important kept emails
     print('\n----- MOST IMPORTANT KEPT EMAILS -----')
-    print(summarize_with_openai(kept))
+    print(summarize_with_ollama(kept))
     print('\nTriage Summary:')
-    print(f' KEPT:     {len(kept)}')
-    print(f' ARCHIVED: {len(archived)}')
-    print(f' TRASHED:  {len(trashed)}')
+    print(f' KEPT:           {len(kept)}')
+    print(f' TO BE ARCHIVED: {len(to_be_archived)}')
+    print(f' DELETED:        {len(deleted)}')
 
 
 if __name__ == "__main__":
