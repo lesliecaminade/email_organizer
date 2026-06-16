@@ -3,8 +3,9 @@ import email
 import hashlib
 import imaplib
 import json
+import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from email.header import decode_header
 from email.message import Message
 from pathlib import Path
@@ -15,6 +16,8 @@ from typing import Any
 EMAIL_CREDENTIALS_PATH = Path("email_credentials.json")
 FEEDBACK_PATH = Path("feedback.json")
 OLLAMA_CREDENTIALS_PATH = Path("ollama_credentials.json")
+GOOGLE_CREDENTIALS_PATH = Path("google_credentials.json")
+GOOGLE_TOKEN_PATH = Path("google_token.json")
 CHARS_PER_TOKEN_ESTIMATE = 4
 MAX_EMAIL_PREVIEW_TOKENS = 300
 MAX_SINGLE_EMAIL_PROMPT_TOKENS = 500
@@ -33,6 +36,13 @@ PLACEHOLDER_VALUES = {
 }
 
 OLLAMA_PLACEHOLDERS = {"", "ollama-server", "model-name"}
+
+GOOGLE_PLACEHOLDER_VALUES = {
+    "",
+    "your-client-id.apps.googleusercontent.com",
+    "your-gcp-project-id",
+    "your-client-secret",
+}
 
 
 @dataclass
@@ -167,6 +177,25 @@ def looks_ollama_configured(value: str | None) -> bool:
     )
 
 
+def looks_google_configured(credentials: dict[str, Any]) -> bool:
+    if not credentials or not isinstance(credentials, dict):
+        return False
+    client_id = (credentials.get("client_id") or "").strip()
+    client_secret = (credentials.get("client_secret") or "").strip()
+    project_id = (credentials.get("project_id") or "").strip()
+    return bool(
+        client_id
+        and client_secret
+        and project_id
+        and client_id not in GOOGLE_PLACEHOLDER_VALUES
+        and client_secret not in GOOGLE_PLACEHOLDER_VALUES
+        and project_id not in GOOGLE_PLACEHOLDER_VALUES
+        and "your-" not in client_id
+        and "your-" not in client_secret
+        and "your-" not in project_id
+    )
+
+
 def load_ollama_client() -> Any:
     """Load and return an Ollama client using configured credentials."""
     from ollama import Client as OllamaClient
@@ -179,6 +208,45 @@ def load_ollama_client() -> Any:
             "Update ollama_credentials.json with a valid server URL."
         )
     return OllamaClient(host=url), cfg
+
+
+def load_google_credentials() -> dict[str, Any]:
+    """Load Google OAuth client secrets from google_credentials.json."""
+    if not GOOGLE_CREDENTIALS_PATH.exists():
+        return {}
+    return load_json(GOOGLE_CREDENTIALS_PATH)
+
+
+def get_google_calendar_service(debug: bool = False) -> Any | None:
+    """Build and return an authorized Google Calendar API service, or None if not configured."""
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+
+    client_secrets = load_google_credentials()
+    if not looks_google_configured(client_secrets):
+        if debug:
+            print("[Calendar] Google credentials not configured; skipping calendar integration.")
+        return None
+
+    scopes = ["https://www.googleapis.com/auth/calendar"]
+    creds: Credentials | None = None
+    if GOOGLE_TOKEN_PATH.exists():
+        creds = Credentials.from_authorized_user_file(str(GOOGLE_TOKEN_PATH), scopes)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                str(GOOGLE_CREDENTIALS_PATH), scopes
+            )
+            creds = flow.run_local_server(port=0)
+        with GOOGLE_TOKEN_PATH.open("w", encoding="utf-8") as token_file:
+            token_file.write(creds.to_json())
+
+    return build("calendar", "v3", credentials=creds)
 
 
 def decode_mime_header(value: str | None) -> str:
@@ -500,6 +568,98 @@ def confirm_mailbox_reduction(host: str, port: int, username: str, password: str
     return after_count, after_count < before_count
 
 
+def extract_event_details(message: EmailMessage, debug: bool = False) -> dict[str, Any] | None:
+    """Use Ollama to extract any calendar-worthy date/time from an email."""
+    try:
+        client, cfg = load_ollama_client()
+    except Exception as e:
+        if debug:
+            print(f"[Calendar] Ollama not available for date extraction: {e}")
+        return None
+
+    ollama_model = cfg.get("model") or "llama3.1"
+    email_text = format_email_for_prompt(message, max_body_tokens=MAX_SINGLE_EMAIL_PROMPT_TOKENS)
+
+    today = date.today().isoformat()
+    prompt = (
+        "You are a calendar assistant. Read the email below and decide if it mentions a specific "
+        "future date and time that should be added to a calendar (meeting, deadline, appointment, event, etc.).\n\n"
+        f"Today's date is {today}.\n\n"
+        "If there is a calendar-worthy event, output exactly one line in this format:\n"
+        "EVENT|YYYY-MM-DD|HH:MM|TITLE|DESCRIPTION\n\n"
+        "Use 24-hour time. If no exact time is given, use 09:00 as a default. "
+        "If the date is relative (e.g., 'tomorrow', 'next Monday'), convert it to YYYY-MM-DD based on today's date. "
+        "TITLE should be short. DESCRIPTION can be a brief summary.\n\n"
+        "If there is no calendar-worthy event, output exactly:\n"
+        "NO_EVENT\n\n"
+        f"Email:\n{email_text}"
+    )
+
+    try:
+        response = client.generate(model=ollama_model, prompt=prompt)
+        raw = response.get("response", "").strip()
+        if debug:
+            print(f"[Calendar] Extraction response: {raw}")
+
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("EVENT|"):
+                parts = line.split("|")
+                if len(parts) >= 5:
+                    return {
+                        "date": parts[1],
+                        "time": parts[2],
+                        "title": parts[3],
+                        "description": parts[4],
+                    }
+            elif line == "NO_EVENT":
+                return None
+        return None
+
+    except Exception as e:
+        if debug:
+            print(f"[Calendar] Date extraction failed: {e}")
+        return None
+
+
+def create_calendar_event(service: Any, account_email: str, event_details: dict[str, Any], debug: bool = False) -> str | None:
+    """Create a Google Calendar event from extracted details. Returns the event ID or None."""
+    try:
+        start_datetime = datetime.fromisoformat(f"{event_details['date']}T{event_details['time']}:00")
+        # Assume local time if no timezone info; Google Calendar API requires a timezone.
+        # Use the system local timezone name via datetime timezone handling.
+        local_tz = datetime.now(timezone.utc).astimezone().tzinfo
+        tz_name = local_tz.tzname(None) or "UTC"
+        start_datetime = start_datetime.replace(tzinfo=local_tz)
+        end_datetime = start_datetime + timedelta(hours=1)
+
+        event_body = {
+            "summary": event_details["title"],
+            "description": event_details["description"],
+            "start": {
+                "dateTime": start_datetime.isoformat(),
+                "timeZone": tz_name,
+            },
+            "end": {
+                "dateTime": end_datetime.isoformat(),
+                "timeZone": tz_name,
+            },
+            "reminders": {
+                "useDefault": True,
+            },
+        }
+
+        event = service.events().insert(calendarId="primary", body=event_body).execute()
+        if debug:
+            print(f"[Calendar] Created event: {event.get('htmlLink')}")
+        return event.get("id")
+
+    except Exception as e:
+        if debug:
+            print(f"[Calendar] Failed to create event: {e}")
+        return None
+
+
 def summarize_with_ollama(messages: list[EmailMessage]) -> str:
     """Use Ollama as the summarization engine."""
     try:
@@ -640,6 +800,10 @@ def main() -> None:
     kept = []
     to_be_archived = []
     deleted = []
+    calendar_events_created = 0
+
+    # Build the Google Calendar service once if credentials are configured.
+    calendar_service = get_google_calendar_service(debug=debug) if args.live else None
 
     for idx, (msg, uid, account) in enumerate(zip(messages, message_uids, message_accounts), start=1):
         action = classify_message_single(msg, debug=debug)
@@ -677,6 +841,21 @@ def main() -> None:
                     uid,
                     debug=debug,
                 )
+
+            # For KEEP and TO BE ARCHIVED emails, try to extract a calendar event.
+            if result in ('KEEP', 'TO BE ARCHIVED') and calendar_service and account:
+                event_details = extract_event_details(msg, debug=debug)
+                if event_details:
+                    event_id = create_calendar_event(
+                        calendar_service,
+                        account.username,
+                        event_details,
+                        debug=debug,
+                    )
+                    if event_id:
+                        calendar_events_created += 1
+                        print(f"   📅 Calendar event created: {event_details['title']} on {event_details['date']}")
+
         if result in ('KEEP',):
             kept.append(msg)
         elif result in ('TO BE ARCHIVED',):
@@ -693,6 +872,8 @@ def main() -> None:
     print(f' KEPT:           {len(kept)}')
     print(f' TO BE ARCHIVED: {len(to_be_archived)}')
     print(f' DELETED:        {len(deleted)}')
+    if calendar_events_created:
+        print(f' CALENDAR EVENTS: {calendar_events_created}')
 
 
 if __name__ == "__main__":

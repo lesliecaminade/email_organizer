@@ -1,4 +1,4 @@
-# Hello World Email Agent
+# Email Agent
 
 This is a tiny Python AI agent that triages your inbox. It runs immediately in demo mode, then can check today's real emails over IMAP when credentials are ready.
 
@@ -24,6 +24,7 @@ Copy the example files:
 ```bash
 cp email_credentials.example.json email_credentials.json
 cp ollama_credentials.example.json ollama_credentials.json
+cp google_credentials.example.json google_credentials.json
 ```
 
 Then edit these new files with your real values.
@@ -104,6 +105,18 @@ In `--live` mode the agent applies the corresponding Gmail action:
 - **TO BE ARCHIVED** → adds the `TO BE ARCHIVED` label and removes the email from the Inbox.
 - **DELETE** → permanently deletes the email.
 
+## Calendar integration
+
+If `google_credentials.json` is configured, the agent also scans **KEEP** and **TO BE ARCHIVED** emails for calendar-worthy dates and creates events in the corresponding Gmail account's primary Google Calendar. On first run, a browser OAuth prompt will appear and a `google_token.json` file will be saved for future runs.
+
+To set up Google Calendar access:
+
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
+2. Create a project and enable the **Google Calendar API**.
+3. Create OAuth 2.0 credentials for a **Desktop app**.
+4. Download the client secrets JSON and paste the values into `google_credentials.json`.
+5. Run the agent with `--live`; authorize access when prompted.
+
 ## What it does
 
-The script prints a hello-world message, gathers emails, classifies them, applies IMAP actions in live mode, and prints a ranked summary of the most important kept items.
+The script prints a hello-world message, gathers emails, classifies them, applies IMAP actions in live mode, creates calendar events when configured, and prints a ranked summary of the most important kept items.
